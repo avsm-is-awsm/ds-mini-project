@@ -1,0 +1,52 @@
+{
+  "info": {
+    "name": "DS Mini Project - Task 1",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base", "value": "http://127.0.0.1:5000" }
+  ],
+  "item": [
+    {
+      "name": "Upload file",
+      "request": {
+        "method": "POST",
+        "url": "{{base}}/files",
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "file", "type": "file", "src": "" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "List files",
+      "request": { "method": "GET", "url": "{{base}}/files" }
+    },
+    {
+      "name": "Download latest version",
+      "request": { "method": "GET", "url": "{{base}}/files/apple.txt" }
+    },
+    {
+      "name": "Download specific version",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base}}/files/apple.txt?version=2",
+          "host": ["{{base}}"],
+          "path": ["files", "apple.txt"],
+          "query": [{ "key": "version", "value": "2" }]
+        }
+      }
+    },
+    {
+      "name": "Delete all versions",
+      "request": { "method": "DELETE", "url": "{{base}}/files/apple.txt" }
+    },
+    {
+      "name": "Nodes",
+      "request": { "method": "GET", "url": "{{base}}/nodes" }
+    }
+  ]
+}
