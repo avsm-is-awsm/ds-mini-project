@@ -108,11 +108,11 @@ def run_for_n(n_nodes, files, repeat, url, out_dir, start=True):
 
 def main():
     parser = argparse.ArgumentParser(description="Task 1 upload/download measurements")
-    parser.add_argument("--dataset", default="dataset")
+    parser.add_argument("--dataset", default="../dataset")
     parser.add_argument("--nodes", type=int, nargs="+", default=[6, 12, 24])
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--url", default="http://127.0.0.1:5000")
-    parser.add_argument("--out", default="results")
+    parser.add_argument("--out", default="../results")
     parser.add_argument("--no-start", action="store_true",
                         help="use a system that's already running (then --nodes is just a label)")
     args = parser.parse_args()
