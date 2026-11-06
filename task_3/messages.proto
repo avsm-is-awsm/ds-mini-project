@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+// Messages between the lead node and the storage nodes (zmq).
+// Every zmq message is: frame 0 = one of these headers, frame 1 = raw file bytes (only when needed).
+// We keep the file out of the protobuf on purpose so we don't copy 10MB around twice.
+//
+// Regenerate after changing this file:
+//   protoc --python_out=. messages.proto
+
+message StorageRequest {
+  enum Type {
+    STORE = 0;
+    GET = 1;
+    DELETE = 2;
+  }
+  Type type = 1;
+  string storage_id = 2;   // name of the blob on the node (uuid the lead hands out)
+  uint32 crc32 = 3;        // STORE only, node checks it before writing
+  uint64 size = 4;
+}
+
+message StorageReply {
+  bool ok = 1;
+  string error = 2;
+  string node_id = 3;
+  uint32 crc32 = 4;        // GET only
+  uint64 size = 5;
+}
