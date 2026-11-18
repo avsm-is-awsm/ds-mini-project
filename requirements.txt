@@ -6,3 +6,4 @@ protobuf
 pyzmq
 boto3
 apscheduler
+pyxdelta

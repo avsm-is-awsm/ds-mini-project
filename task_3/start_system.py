@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def start_system(n_nodes, data_dir="data", port=5000, rpc_port=5001,
-                 node_base_port=5100, fresh=True):
+                 node_base_port=5100, fresh=True, delta_mode="first"):
     data_dir = os.path.abspath(data_dir)
     if fresh and os.path.isdir(data_dir):
         shutil.rmtree(data_dir)
@@ -37,7 +37,8 @@ def start_system(n_nodes, data_dir="data", port=5000, rpc_port=5001,
 
     launch("lead", "lead_node.py",
            "--port", str(port), "--rpc-port", str(rpc_port),
-           "--db", os.path.join(data_dir, "lead.db"))
+           "--db", os.path.join(data_dir, "lead.db"),
+           "--delta-mode", delta_mode)
 
     for i in range(1, n_nodes + 1):
         node_id = f"node{i:02d}"
@@ -88,15 +89,19 @@ def main():
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--data-dir", default="data")
     parser.add_argument("--keep", action="store_true", help="keep files from the last run")
+    parser.add_argument("--delta-mode", choices=["first", "previous"], default="first",
+                        help="first = deltas against v1 (option a), previous = against the last version (option b)")
     args = parser.parse_args()
 
     if args.nodes < 3:
         parser.error("need at least 3 nodes for 3 replicas")
 
-    procs = start_system(args.nodes, data_dir=args.data_dir, port=args.port, fresh=not args.keep)
+    procs = start_system(args.nodes, data_dir=args.data_dir, port=args.port, fresh=not args.keep,
+                         delta_mode=args.delta_mode)
     try:
         wait_until_ready(procs, args.nodes, f"http://127.0.0.1:{args.port}")
-        print(f"System up: lead on http://127.0.0.1:{args.port} with {args.nodes} storage nodes")
+        print(f"System up: lead on http://127.0.0.1:{args.port} with {args.nodes} storage nodes, "
+              f"delta mode '{args.delta_mode}'")
         print("Ctrl+C to stop")
         while True:
             time.sleep(1)

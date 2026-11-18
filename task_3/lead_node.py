@@ -1,11 +1,25 @@
 """
-Lead node (Task 1 - full replication).
+Lead node (Task 3 - replication + delta encoding).
+
+Same system as Task 1, but only the first version of a file is stored in full.
+Every later version is stored as a VCDIFF delta (xdelta3, through pyxdelta)
+against an older version, and the delta is what gets replicated to 3 nodes.
+
+Two modes, picked with --delta-mode when the lead starts:
+  first     option (a) from the assignment: the delta of v_i is always made
+            against v1. To read v_i we need v1 + one delta.
+  previous  option (b): the delta of v_i is made against v_(i-1), so the
+            versions form a chain. To read v_i we need v1 + all deltas up to i.
+
+The storage nodes didn't change, they have no idea if a blob is a full file
+or a delta.
 
 What lives here:
   - REST API with Flask for the client / Postman (upload, download, list, delete)
-  - metadata in SQLite: which file, which version, which 3 nodes hold it
-  - every upload gets copied in full to 3 different storage nodes over zmq
-    (protobuf header frame + raw bytes frame), all 3 in parallel
+  - metadata in SQLite: which file, which version, which 3 nodes hold it, and
+    for a delta which version it was made against
+  - every upload gets (delta) encoded, then copied to 3 different storage nodes
+    over zmq (protobuf header frame + raw bytes frame), all 3 in parallel
   - tinyrpc JSON-RPC endpoint where the storage nodes register / heartbeat
   - an apscheduler job that marks nodes dead if the heartbeats stop
 
@@ -21,6 +35,7 @@ import os
 import random
 import re
 import sqlite3
+import tempfile
 import time
 import uuid
 import zlib
@@ -29,6 +44,7 @@ import gevent
 import gevent.lock
 import gevent.pywsgi
 import gevent.queue
+import pyxdelta
 import zmq.green as zmq  # green zmq, otherwise one slow node blocks every other request
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, make_response, g, request, send_file
@@ -43,6 +59,8 @@ REPLICAS = 3
 NODE_TIMEOUT = 6.0        # seconds without heartbeat -> we stop picking that node
 ZMQ_TIMEOUT_MS = 30_000  # for store/get, 10MB can take a moment on a slow disk
 CONTROL_TIMEOUT_MS = 3_000  # for small things like delete
+
+DELTA_MODE = "first"      # "first" = option (a), "previous" = option (b), see --delta-mode
 
 DB_PATH = "data/lead.db"  # set from the command line in main()
 
@@ -84,8 +102,12 @@ def init_db():
             base_name   TEXT NOT NULL,      -- apple.txt
             version     INTEGER NOT NULL,   -- 3
             filename    TEXT NOT NULL,      -- apple_v3.txt
-            size        INTEGER NOT NULL,
-            crc32       INTEGER NOT NULL,
+            size        INTEGER NOT NULL,   -- original size (B)
+            crc32       INTEGER NOT NULL,   -- of the original bytes
+            encoding    TEXT NOT NULL,      -- 'full' or 'vcdiff'
+            ref_version INTEGER,            -- vcdiff only: version the delta was made against
+            stored_size INTEGER NOT NULL,   -- size of what's on the nodes (B_delta,i)
+            stored_crc32 INTEGER NOT NULL,  -- of the stored blob
             storage_id  TEXT NOT NULL,      -- blob name on the nodes
             created     REAL NOT NULL,
             UNIQUE (base_name, version)
@@ -238,6 +260,107 @@ def replicate(storage_id, data, crc):
     return stored
 
 
+# ---------------------------------------------------------------- delta encoding
+
+def _write(path, data):
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _read(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+# pyxdelta only takes file paths, so source/target/patch go through a temp folder.
+# Those disk writes are part of the encode/decode time we measure, which is fair,
+# the xdelta3 command line tool would do exactly the same.
+
+def xdelta_encode(source, target):
+    """VCDIFF delta that turns `source` into `target`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src, tgt, patch = (os.path.join(tmp, n) for n in ("source", "target", "patch"))
+        _write(src, source)
+        _write(tgt, target)
+        if not pyxdelta.run(src, tgt, patch):
+            raise RuntimeError("xdelta3 could not create the delta")
+        return _read(patch)
+
+
+def xdelta_decode(source, delta):
+    """Apply a VCDIFF delta to `source`, gives back the target."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src, patch, out = (os.path.join(tmp, n) for n in ("source", "patch", "out"))
+        _write(src, source)
+        _write(patch, delta)
+        if not pyxdelta.decode(src, patch, out):
+            raise RuntimeError("xdelta3 could not apply the delta")
+        return _read(out)
+
+
+def load_chain(db, base_name, version):
+    """Everything needed to rebuild `version`, oldest first: the full file and
+    then the deltas in the order they have to be applied.
+    Mode 'first' gives [v1, delta_i], mode 'previous' gives [v1, delta_2, ..., delta_i].
+    Each entry is (file row, nodes holding that blob), so the db isn't needed afterwards."""
+    chain = []
+    while version is not None:
+        row = db.execute("SELECT * FROM files WHERE base_name = ? AND version = ?",
+                         (base_name, version)).fetchone()
+        if row is None:
+            raise LookupError(f"{base_name} version {version} is missing, can't rebuild from it")
+        holders = [r["node_id"] for r in
+                   db.execute("SELECT node_id FROM replicas WHERE file_id = ?", (row["id"],))]
+        chain.append((row, holders))
+        version = row["ref_version"]
+    chain.reverse()
+    return chain
+
+
+def fetch_blob(row, holders):
+    """Get one stored blob from any node that has it and check its crc."""
+    # random order spreads the reads over the 3 copies, alive nodes go first
+    holders = list(holders)
+    random.shuffle(holders)
+    holders.sort(key=lambda n: not (n in nodes and nodes[n]["alive"]))
+
+    for node_id in holders:
+        if node_id not in nodes:
+            continue
+        blob = fetch_replica(node_id, row["storage_id"])
+        if blob is not None and zlib.crc32(blob) == row["stored_crc32"]:
+            return blob, node_id
+    raise IOError(f"no replica of {row['filename']} could be read")
+
+
+def rebuild(chain):
+    """Fetch every blob of the chain and apply the deltas. Returns (data, stats)."""
+    # Christian - the blobs are fetched one after the other on purpose, that's
+    # what the analysis assumes (sum of all B_delta over the lead's link).
+    # Fetching them in parallel would be an easy speedup for mode 'previous'.
+    stats = {"blobs": 0, "fetched_bytes": 0, "fetch_s": 0.0, "decode_s": 0.0, "nodes": []}
+    data = None
+    for row, holders in chain:
+        t0 = time.perf_counter()
+        blob, node_id = fetch_blob(row, holders)
+        stats["fetch_s"] += time.perf_counter() - t0
+        stats["blobs"] += 1
+        stats["fetched_bytes"] += len(blob)
+        stats["nodes"].append(node_id)
+
+        if row["encoding"] == "full":
+            data = blob
+        else:
+            t0 = time.perf_counter()
+            data = xdelta_decode(data, blob)
+            stats["decode_s"] += time.perf_counter() - t0
+
+    wanted = chain[-1][0]
+    if zlib.crc32(data) != wanted["crc32"]:
+        raise IOError(f"{wanted['filename']} is corrupt after decoding")
+    return data, stats
+
+
 # ---------------------------------------------------------------- REST API
 
 @app.route("/files", methods=["POST"])
@@ -252,12 +375,26 @@ def upload_file():
 
     # is this a brand new file or a new version of something we already have?
     db = get_db()
-    existing = [row["version"] for row in
-                db.execute("SELECT version FROM files WHERE base_name = ?", (base_name,))]
+    existing = sorted(row["version"] for row in
+                      db.execute("SELECT version FROM files WHERE base_name = ?", (base_name,)))
     if version is None:
         version = max(existing, default=0) + 1
     elif version in existing:
         return make_response({"error": f"{base_name} version {version} is already stored"}, 409)
+    elif existing and version < existing[-1]:
+        # a delta always points back at an older version, so we can't slot one in afterwards
+        return make_response({"error": f"versions have to be uploaded in order, "
+                                       f"{base_name} is already at version {existing[-1]}"}, 409)
+
+    # new file -> stored in full. New version -> delta against the first version
+    # (option a) or against the newest one we have (option b)
+    ref_version, chain = None, []
+    if existing:
+        ref_version = existing[0] if DELTA_MODE == "first" else existing[-1]
+        try:
+            chain = load_chain(db, base_name, ref_version)
+        except LookupError as e:
+            return make_response({"error": str(e)}, 500)
 
     if len(alive_nodes()) < REPLICAS:
         return make_response({"error": f"need {REPLICAS} alive nodes, have {len(alive_nodes())}"}, 503)
@@ -267,8 +404,29 @@ def upload_file():
     g._database = None
 
     crc = zlib.crc32(data)
+    blob, encoding = data, "full"
+    reference_s = encode_s = 0.0
+    if ref_version is not None:
+        # the lead doesn't keep old versions around, it has to get the reference
+        # back from the storage nodes first (for option b that means the whole chain)
+        t0 = time.perf_counter()
+        try:
+            reference, _ = rebuild(chain)
+        except IOError as e:
+            return make_response({"error": f"can't read the reference version: {e}"}, 503)
+        reference_s = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        delta = xdelta_encode(reference, data)
+        encode_s = time.perf_counter() - t0
+        if len(delta) < len(data):
+            blob, encoding = delta, "vcdiff"
+        else:
+            ref_version = None  # completely different content, a delta would only cost us
+
+    blob_crc = zlib.crc32(blob)
     storage_id = uuid.uuid4().hex
-    stored_on = replicate(storage_id, data, crc)
+    stored_on = replicate(storage_id, blob, blob_crc)
     if len(stored_on) < REPLICAS:
         delete_replicas(storage_id, stored_on)
         return make_response({"error": f"only {len(stored_on)} of {REPLICAS} replicas could be stored"}, 503)
@@ -276,9 +434,10 @@ def upload_file():
     db = get_db()
     try:
         cur = db.execute(
-            "INSERT INTO files (base_name, version, filename, size, crc32, storage_id, created) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (base_name, version, versioned_name(base_name, version), len(data), crc, storage_id, time.time()))
+            "INSERT INTO files (base_name, version, filename, size, crc32, encoding, ref_version, "
+            "stored_size, stored_crc32, storage_id, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (base_name, version, versioned_name(base_name, version), len(data), crc, encoding,
+             ref_version, len(blob), blob_crc, storage_id, time.time()))
     except sqlite3.IntegrityError:
         # two uploads of the same version at the same time, the other one won
         delete_replicas(storage_id, stored_on)
@@ -287,15 +446,23 @@ def upload_file():
                    [(cur.lastrowid, n) for n in stored_on])
     db.commit()
 
-    print(f"[lead] {versioned_name(base_name, version)} ({len(data)} B) -> {', '.join(stored_on)}")
+    what = "full" if encoding == "full" else f"delta vs v{ref_version}"
+    print(f"[lead] {versioned_name(base_name, version)} ({len(data)} B -> {len(blob)} B, {what}) "
+          f"-> {', '.join(stored_on)}")
     return make_response({
         "id": cur.lastrowid,
         "filename": versioned_name(base_name, version),
         "base_name": base_name,
         "version": version,
         "new_file": not existing,
-        "previous_versions": sorted(existing),
+        "previous_versions": existing,
         "size": len(data),
+        "delta_mode": DELTA_MODE,
+        "encoding": encoding,
+        "ref_version": ref_version,
+        "stored_size": len(blob),
+        "reference_s": reference_s,   # time to get the reference version back from the nodes
+        "encode_s": encode_s,
         "nodes": stored_on,
     }, 201)
 
@@ -303,7 +470,8 @@ def upload_file():
 @app.route("/files", methods=["GET"])
 def list_files():
     rows = get_db().execute("""
-        SELECT base_name, MAX(version) AS latest_version, COUNT(*) AS versions
+        SELECT base_name, MAX(version) AS latest_version, COUNT(*) AS versions,
+               SUM(size) AS total_size, SUM(stored_size) AS total_stored_size
         FROM files GROUP BY base_name ORDER BY base_name
     """).fetchall()
     return make_response({"files": [dict(r) for r in rows]})
@@ -316,38 +484,43 @@ def download_file(name):
     if row is None:
         return make_response({"error": f"{name} not found"}, 404)
 
-    holders = [r["node_id"] for r in
-               db.execute("SELECT node_id FROM replicas WHERE file_id = ?", (row["id"],))]
-    # random order spreads the reads over the 3 copies, alive nodes go first
-    random.shuffle(holders)
-    holders.sort(key=lambda n: not (n in nodes and nodes[n]["alive"]))
+    try:
+        chain = load_chain(db, row["base_name"], row["version"])
+    except LookupError as e:
+        return make_response({"error": str(e)}, 500)
+    close_db(None)
+    g._database = None
 
-    for node_id in holders:
-        if node_id not in nodes:
-            continue
-        data = fetch_replica(node_id, row["storage_id"])
-        if data is not None and zlib.crc32(data) == row["crc32"]:
-            break
-    else:
-        return make_response({"error": f"no replica of {row['filename']} could be read"}, 503)
+    try:
+        data, stats = rebuild(chain)
+    except IOError as e:
+        return make_response({"error": str(e)}, 503)
 
     response = send_file(io.BytesIO(data), mimetype="application/octet-stream",
                          as_attachment=True, download_name=row["filename"])
     response.headers["X-File-Version"] = str(row["version"])
-    response.headers["X-Served-By"] = node_id
+    response.headers["X-Served-By"] = ", ".join(stats["nodes"])
+    response.headers["X-Encoding"] = row["encoding"]
+    response.headers["X-Stored-Size"] = str(row["stored_size"])
+    response.headers["X-Blobs-Fetched"] = str(stats["blobs"])
+    response.headers["X-Fetched-Bytes"] = str(stats["fetched_bytes"])
+    response.headers["X-Decode-Seconds"] = f"{stats['decode_s']:.6f}"
     return response
 
 
 @app.route("/files/<path:name>", methods=["DELETE"])
 def delete_file(name):
-    """apple.txt deletes all versions, apple_v2.txt only that one."""
+    """apple.txt deletes all versions. apple_v3.txt only works for the newest
+    version, older ones may be the reference of a delta."""
     db = get_db()
     base_name, version = split_version(name)
-    if version is None:
-        rows = db.execute("SELECT * FROM files WHERE base_name = ?", (base_name,)).fetchall()
-    else:
-        rows = db.execute("SELECT * FROM files WHERE base_name = ? AND version = ?",
-                          (base_name, version)).fetchall()
+    rows = db.execute("SELECT * FROM files WHERE base_name = ? ORDER BY version",
+                      (base_name,)).fetchall()
+    if version is not None:
+        if rows and version != rows[-1]["version"] and any(r["version"] == version for r in rows):
+            return make_response({"error": f"only the newest version (v{rows[-1]['version']}) can be "
+                                           f"deleted on its own, newer deltas may depend on v{version}"}, 409)
+        rows = [r for r in rows if r["version"] == version]
     if not rows:
         return make_response({"error": f"{name} not found"}, 404)
 
@@ -410,9 +583,11 @@ def check_nodes():
 
 
 def main():
-    global DB_PATH
+    global DB_PATH, DELTA_MODE
 
     parser = argparse.ArgumentParser(description="Lead node")
+    parser.add_argument("--delta-mode", choices=["first", "previous"], default=DELTA_MODE,
+                        help="first = delta against v1 (option a), previous = against the last version (option b)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5000, help="REST API port")
     parser.add_argument("--rpc-port", type=int, default=5001, help="port the nodes register on")
@@ -422,6 +597,7 @@ def main():
     args = parser.parse_args()
 
     DB_PATH = args.db
+    DELTA_MODE = args.delta_mode
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     if args.fresh and os.path.exists(DB_PATH):
         os.remove(DB_PATH)
@@ -439,7 +615,8 @@ def main():
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown(wait=False))
 
-    print(f"[lead] REST API on http://{args.host}:{args.port}, node RPC on port {args.rpc_port}")
+    print(f"[lead] REST API on http://{args.host}:{args.port}, node RPC on port {args.rpc_port}, "
+          f"delta mode '{DELTA_MODE}'")
     http = gevent.pywsgi.WSGIServer((args.host, args.port), app,
                                     log="default" if args.access_log else None)
     try:
