@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+message StoreDataRequest
+{
+    string filename = 1;
+}
+
+message GetDataRequest
+{
+    string filename = 1;
+}
